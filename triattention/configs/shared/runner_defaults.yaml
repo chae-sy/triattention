@@ -1,8 +1,9 @@
 experiment:
-  conda_env: triattention
+  conda_env: tri
   runner_path: scripts/worker.py
   merged_dir_name: merged
-  gpus: auto
+  gpus: 
+    - 7
   auto_gpu_fallback:
     - 0
     - 1
@@ -12,13 +13,13 @@ experiment:
     - 5
     - 6
     - 7
-  num_shards: 8
+  num_shards: 1
   gpu_memory_threshold: 5000
   env: {}
 runner_args:
   eval_batch_size: 1
   seed: 888
-  attn_implementation: flash_attention_2
+  attn_implementation: sdpa
   load_dtype: bfloat16
   fp32_topk: false
   num_samples: 64

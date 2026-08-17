@@ -297,8 +297,8 @@ def main() -> None:
         help="Device to run on (default: cuda).",
     )
     parser.add_argument(
-        "--attn-implementation", default="flash_attention_2",
-        help="Attention implementation (default: flash_attention_2).",
+        "--attn-implementation", default="sdpa",
+        help="Attention implementation (default: sdpa).",
     )
     args = parser.parse_args()
     calibrate(

@@ -359,14 +359,31 @@ def dispatch_run(config_path: Path, dataset: str, log_dir: Path, dry_run: bool) 
 
 
 def validate_model_exists(model_name: str, dry_run: bool) -> Path:
-    model_path = resolve_model_path(model_name)
+    from huggingface_hub import snapshot_download
+
+    repo_id = MODEL_SPECS[model_name]
+
+    try:
+        model_path = Path(
+            snapshot_download(
+                repo_id=repo_id,
+                local_files_only=True,
+            )
+        )
+    except Exception as e:
+        if dry_run:
+            print(f"[dry-run] Hugging Face model: {repo_id}")
+            return Path(repo_id)
+
+        raise FileNotFoundError(
+            f"Model {repo_id} was not found in the Hugging Face cache.\n"
+            f"Download it first with:\n"
+            f"  huggingface-cli download {repo_id}"
+        ) from e
+
     if dry_run:
         print(f"[dry-run] model path: {model_path}")
-        return model_path
-    if not model_path.exists() or not any(model_path.iterdir()):
-        raise FileNotFoundError(
-            f"Model not found at {model_path}. Run scripts/download_models_v2.sh first."
-        )
+
     return model_path
 
 
@@ -588,7 +605,7 @@ def build_stats(
             "--device",
             "cuda",
             "--attn-implementation",
-            "flash_attention_2",
+            "sdpa",
         ]
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{REPO_ROOT}:{env.get('PYTHONPATH', '')}".strip(":")
@@ -662,6 +679,59 @@ def download_models() -> None:
         )
 
 
+
+def run_throughput(args: argparse.Namespace) -> None:
+    """Launch the standalone single-GPU maximum-batch throughput benchmark."""
+    model_path = validate_model_exists(args.model, args.dry_run)
+    stats_path = resolve_stats_path(args.stats_path)
+    if not stats_path.exists() and not args.dry_run:
+        raise FileNotFoundError(f"TriAttention stats file not found: {stats_path}")
+
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "throughput.py"),
+        "--model", str(model_path),
+        "--stats-path", str(stats_path),
+        "--prompt-length", str(args.prompt_length),
+        "--generation-lengths", args.generation_lengths,
+        "--repeats", str(args.repeats),
+        "--warmup", str(args.warmup),
+        "--budget", str(args.budget),
+        "--divide-length", str(args.divide_length),
+        "--device", args.device,
+        "--dtype", args.dtype,
+        "--attn-implementation", args.attn_implementation,
+        "--seed", str(args.seed),
+        "--score-aggregation", args.score_aggregation,
+        "--max-batch-limit", str(args.max_batch_limit),
+        "--mode", args.mode,
+        "--output", str(args.output),
+    ]
+    if args.batch_size is not None:
+        cmd.extend(["--batch-size", str(args.batch_size)])
+    if args.trust_remote_code:
+        cmd.append("--trust-remote-code")
+    if args.normalize_scores:
+        cmd.append("--normalize-scores")
+    if args.per_head_pruning:
+        cmd.append("--per-head-pruning")
+    if args.per_layer_perhead_pruning:
+        cmd.append("--per-layer-perhead-pruning")
+    if args.disable_mlr:
+        cmd.append("--disable-mlr")
+    if args.disable_trig:
+        cmd.append("--disable-trig")
+    cmd.extend(["--layer-perhead-aggregation", args.layer_perhead_aggregation])
+
+    if args.dry_run:
+        print("[dry-run] " + " ".join(cmd))
+        return
+
+    env = os.environ.copy()
+    pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{REPO_ROOT}:{pythonpath}" if pythonpath else str(REPO_ROOT)
+    subprocess.check_call(cmd, cwd=str(REPO_ROOT), env=env)
+
 def resolve_budget_for_mode(mode: str, budget: int | None, model_name: str | None = None) -> int | None:
     if mode == "fullkv":
         return None
@@ -710,6 +780,52 @@ def parse_args() -> argparse.Namespace:
         help="Maximum concurrent stats jobs.",
     )
 
+
+    throughput_parser = subparsers.add_parser(
+        "throughput",
+        help="Measure single-GPU maximum-feasible-batch decode throughput for FullKV and TriAttention.",
+    )
+    throughput_parser.add_argument("--model", required=True, choices=MODEL_SPECS.keys())
+    throughput_parser.add_argument("--stats-path", required=True)
+    throughput_parser.add_argument("--prompt-length", type=int, default=2048)
+    throughput_parser.add_argument("--generation-lengths", default="256,512,1024")
+    throughput_parser.add_argument("--repeats", type=int, default=5)
+    throughput_parser.add_argument("--warmup", type=int, default=1)
+    throughput_parser.add_argument("--budget", type=int, default=2048)
+    throughput_parser.add_argument("--divide-length", type=int, default=128)
+    throughput_parser.add_argument("--device", default="cuda")
+    throughput_parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
+    throughput_parser.add_argument(
+        "--attn-implementation", choices=["sdpa", "eager"], default="sdpa"
+    )
+    throughput_parser.add_argument("--trust-remote-code", action="store_true")
+    throughput_parser.add_argument("--seed", type=int, default=888)
+    throughput_parser.add_argument("--score-aggregation", choices=["mean", "max"], default="mean")
+    throughput_parser.add_argument("--normalize-scores", action="store_true")
+    throughput_parser.add_argument("--per-head-pruning", action="store_true")
+    throughput_parser.add_argument("--per-layer-perhead-pruning", action="store_true")
+    throughput_parser.add_argument(
+        "--layer-perhead-aggregation", choices=["mean", "max"], default="max"
+    )
+    throughput_parser.add_argument("--disable-mlr", action="store_true")
+    throughput_parser.add_argument("--disable-trig", action="store_true")
+    throughput_parser.add_argument("--max-batch-limit", type=int, default=64)
+    throughput_parser.add_argument(
+        "--mode",
+        choices=["both", "tri_only"],
+        default="both",
+        help="Benchmark both FullKV/TriAttention or only TriAttention.",
+    )
+    throughput_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Fixed-batch mode; skips max-batch search for both methods.",
+    )
+    throughput_parser.add_argument(
+        "--output", type=Path, default=Path("profiles/decode_throughput.csv")
+    )
+
     run_one_parser = subparsers.add_parser("run-one", help="Run a single dataset/model/method/budget.")
     run_one_parser.add_argument("--dataset", required=True, choices=DATASETS)
     run_one_parser.add_argument("--model", required=True, choices=MODEL_SPECS.keys())
@@ -755,6 +871,9 @@ def main() -> None:
             max_length=args.max_length,
             job_parallel=args.job_parallel,
         )
+        return
+    if args.command == "throughput":
+        run_throughput(args)
         return
     if args.command == "run-one":
         defaults = load_runner_defaults()

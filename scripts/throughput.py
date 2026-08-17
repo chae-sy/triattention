@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
-"""Measure maximum-feasible-batch decode throughput for Full KV and TriAttention.
+"""Measure maximum-feasible-batch decode throughput for FullKV and TriAttention.
 
-Each feasibility test and final measurement runs in a fresh subprocess.  Prefill
-is completed before timing; reported latency is host-wall-clock decode latency.
+This follows scripts/profile.py closely:
+  * deterministic prompt construction
+  * greedy argmax decoding
+  * prompt prefill excluded from decode wall-clock timing
+  * FullKV / TriAttention run in separate fresh subprocesses
+  * TriAttention patch arguments match profile.py
+
+Maximum batch size is found independently for each (method, generation_length).
+Every feasibility candidate runs in a fresh subprocess and must complete prefill
+plus the entire requested decode length. After max batch is found, every warmup
+and every measured repeat also runs in its own fresh subprocess. CUDA OOM is the
+only failure treated as "batch too large"; all unrelated errors are surfaced.
 
 Example:
     python scripts/throughput.py \
         --model Qwen/Qwen3-8B \
         --stats-path triattention/calibration/for_aime24_experiment/qwen3_8b.pt \
-        --prompt-length 2048 --generation-lengths 8192,16384 \
-        --budget 2048 --output profiles/qwen3_throughput.csv
+        --prompt-length 128 \
+        --generation-lengths 8192,16384,32768,65536 \
+        --budget 2048 \
+        --max-batch-limit 64 \
+        --output profiles/decode_throughput.csv
 """
 from __future__ import annotations
 
 import argparse
 import csv
-import gc
 import json
-import os
 import random
 import subprocess
 import sys
@@ -25,9 +36,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-# ``scripts/profile.py`` shadows the stdlib ``profile`` module while this
-# script is launched from scripts/.  Remove that directory before importing
-# PyTorch, whose cProfile dependency imports the stdlib module by name.
+# Avoid scripts/profile.py shadowing Python's stdlib `profile` during torch import.
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 if sys.path and Path(sys.path[0]).resolve() == SCRIPT_DIR:
@@ -40,12 +49,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 RESULT_PREFIX = "THROUGHPUT_RESULT="
+FEASIBLE_PREFIX = "THROUGHPUT_FEASIBLE="
+OOM_EXIT_CODE = 42
 DEFAULT_PROMPT = "Solve the following problem carefully and explain your reasoning. "
 
 
 def parse_lengths(raw: str) -> list[int]:
-    lengths = [int(value.strip()) for value in raw.split(",") if value.strip()]
-    if not lengths or any(value <= 0 for value in lengths):
+    lengths = [int(v.strip()) for v in raw.split(",") if v.strip()]
+    if not lengths or any(v <= 0 for v in lengths):
         raise argparse.ArgumentTypeError(
             "--generation-lengths must be a non-empty comma-separated list of positive integers"
         )
@@ -65,26 +76,16 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def release_cached_cuda_memory(device: torch.device) -> None:
-    """Release allocations left by a completed warmup or measurement."""
-    if device.type == "cuda":
-        synchronize(device)
-        gc.collect()
-        torch.cuda.empty_cache()
-
-
 def build_prompt_inputs(
-    tokenizer: Any, prompt_length: int, batch_size: int, device: torch.device
+    tokenizer: Any,
+    prompt_length: int,
+    batch_size: int,
+    device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """Build identical deterministic prompts with shape [batch_size, prompt_length].
-
-    Identical sequences are intentional: the current TriAttention scorer reads
-    ``key_states[0, ...]`` when choosing shared keep indices, then gathers those
-    indices across every batch item.  Greedy decoding keeps these replicas equal.
-    """
+    """Build the same deterministic prompt for every sequence: [B, prompt_length]."""
     base_ids = tokenizer.encode(DEFAULT_PROMPT, add_special_tokens=False)
     if not base_ids:
-        raise ValueError("The tokenizer produced no tokens for the built-in profiling prompt.")
+        raise ValueError("The tokenizer produced no tokens for the built-in throughput prompt.")
 
     token_ids: list[int] = []
     if tokenizer.bos_token_id is not None:
@@ -93,8 +94,8 @@ def build_prompt_inputs(
         token_ids.extend(base_ids)
     token_ids = token_ids[:prompt_length]
 
-    one_prompt = torch.tensor(token_ids, dtype=torch.long, device=device)
-    input_ids = one_prompt.unsqueeze(0).expand(batch_size, -1).clone()
+    one = torch.tensor(token_ids, dtype=torch.long, device=device).unsqueeze(0)
+    input_ids = one.expand(batch_size, -1).contiguous()
     return {
         "input_ids": input_ids,
         "attention_mask": torch.ones_like(input_ids, device=device),
@@ -103,7 +104,7 @@ def build_prompt_inputs(
 
 def apply_triattention(model: Any, args: argparse.Namespace) -> None:
     if args.stats_path is None:
-        raise ValueError("--stats-path is required when profiling TriAttention.")
+        raise ValueError("--stats-path is required for TriAttention throughput.")
     stats_path = Path(args.stats_path).expanduser().resolve()
     if not stats_path.is_file():
         raise FileNotFoundError(f"TriAttention statistics file not found: {stats_path}")
@@ -114,12 +115,10 @@ def apply_triattention(model: Any, args: argparse.Namespace) -> None:
         model,
         stats_path=stats_path,
         model_path=Path(args.model),
-        kv_budget=args.budget,
+        kv_budget=args.budget,  # budget remains per sequence; benchmark does not rescale it by B
         score_aggregation=args.score_aggregation,
         pruning_seed=args.seed,
         normalize_scores=args.normalize_scores,
-        # Matches profile.py: prompt tokens count toward a per-sequence budget,
-        # while prefill execution remains outside the timed region.
         count_prompt_tokens=True,
         divide_length=args.divide_length,
         per_head_pruning=args.per_head_pruning,
@@ -137,7 +136,7 @@ def decode_once(
     generation_length: int,
     device: torch.device,
 ) -> float:
-    """Run one prefill plus decode sequence and return decode-only wall time."""
+    """Return decode-only host wall time. Prefill is intentionally untimed."""
     prefill = model(**prompt_inputs, use_cache=True, return_dict=True)
     synchronize(device)
 
@@ -149,7 +148,8 @@ def decode_once(
     started = time.perf_counter()
     for _ in range(generation_length):
         attention_mask = torch.cat(
-            (attention_mask, torch.ones_like(next_token, device=device)), dim=-1
+            (attention_mask, torch.ones_like(next_token, device=device)),
+            dim=-1,
         )
         output = model(
             input_ids=next_token,
@@ -159,205 +159,345 @@ def decode_once(
             return_dict=True,
         )
         past_key_values = output.past_key_values
+        # Keep greedy token selection inside the timed decode region.
         next_token = output.logits[:, -1:].argmax(dim=-1)
     synchronize(device)
     return time.perf_counter() - started
 
 
-def load_model_and_inputs(
-    args: argparse.Namespace, batch_size: int
-) -> tuple[Any, dict[str, torch.Tensor], torch.device]:
+def load_worker_state(args: argparse.Namespace) -> tuple[Any, Any, torch.device]:
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
+
     device = torch.device(args.device)
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
     set_seed(args.seed)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        trust_remote_code=args.trust_remote_code,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=dtype,
+        dtype=dtype,
         low_cpu_mem_usage=True,
         trust_remote_code=args.trust_remote_code,
         attn_implementation=args.attn_implementation,
     ).to(device)
     model.eval()
+
     if args.method == "triattention":
         apply_triattention(model, args)
-    return model, build_prompt_inputs(tokenizer, args.prompt_length, batch_size, device), device
+
+    return tokenizer, model, device
 
 
-def run_feasibility_worker(args: argparse.Namespace) -> dict[str, object]:
-    """A batch is feasible only when prefill and all decode steps finish."""
+def is_cuda_oom(exc: BaseException) -> bool:
+    # torch.OutOfMemoryError is CUDA's dedicated OOM exception in current PyTorch.
+    return isinstance(exc, torch.OutOfMemoryError)
+
+
+def feasibility_worker(args: argparse.Namespace) -> None:
+    """One fresh process: batch is feasible only after the full generation completes."""
     try:
-        model, prompt_inputs, device = load_model_and_inputs(args, args.batch_size)
-        decode_once(model, prompt_inputs, args.generation_lengths[0], device)
-        return {"feasible": True}
-    except torch.cuda.OutOfMemoryError:
-        # This process exits immediately after reporting, but clear cached blocks
-        # as well to make cleanup explicit for CUDA runtimes that keep the context.
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return {"feasible": False}
-
-
-def run_measurement_worker(args: argparse.Namespace) -> list[dict[str, object]]:
-    model, prompt_inputs, device = load_model_and_inputs(args, args.batch_size)
-    generation_length = args.generation_lengths[0]
-
-    for _ in range(args.warmup):
-        decode_once(model, prompt_inputs, generation_length, device)
-    # ``decode_once`` owns all per-request KV tensors.  Drop its cached blocks
-    # before the first measured request so warmup allocator state cannot make a
-    # boundary-size batch fail solely through fragmentation.
-    release_cached_cuda_memory(device)
-
-    rows: list[dict[str, object]] = []
-    for repeat in range(args.repeats):
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-        latency_s = decode_once(model, prompt_inputs, generation_length, device)
-        peak_allocated_mb = ""
-        peak_reserved_mb = ""
-        if device.type == "cuda":
-            peak_allocated_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
-            peak_reserved_mb = torch.cuda.max_memory_reserved(device) / (1024**2)
-        total_tokens = args.batch_size * generation_length
-        rows.append(
-            {
-                "method": args.method,
-                "repeat": repeat,
-                "model": args.model,
-                "prompt_tokens": args.prompt_length,
-                "generation_tokens": generation_length,
-                "max_batch_size": args.batch_size,
-                "decode_latency_s": latency_s,
-                "throughput_tokens_per_second": total_tokens / latency_s,
-                "per_sequence_tokens_per_second": generation_length / latency_s,
-                "peak_memory_allocated_mb": peak_allocated_mb,
-                "peak_memory_reserved_mb": peak_reserved_mb,
-                "budget": args.budget if args.method == "triattention" else "",
-                "device": str(device),
-                "dtype": args.dtype,
-            }
+        tokenizer, model, device = load_worker_state(args)
+        prompt_inputs = build_prompt_inputs(
+            tokenizer, args.prompt_length, args.batch_size, device
         )
-        release_cached_cuda_memory(device)
-    return rows
+        decode_once(model, prompt_inputs, args.worker_generation_length, device)
+        print(FEASIBLE_PREFIX + json.dumps({"batch_size": args.batch_size}))
+    except BaseException as exc:
+        if is_cuda_oom(exc):
+            # This process exits immediately, so allocator state cannot contaminate
+            # the next candidate process.
+            print(
+                FEASIBLE_PREFIX
+                + json.dumps({"batch_size": args.batch_size, "oom": True}),
+                flush=True,
+            )
+            raise SystemExit(OOM_EXIT_CODE)
+        raise
 
 
-def worker_command(
-    args: argparse.Namespace, method: str, generation_length: int, batch_size: int, mode: str
+def single_run_worker(args: argparse.Namespace) -> None:
+    """Run exactly one full prefill+decode in this fresh worker process."""
+    tokenizer, model, device = load_worker_state(args)
+    prompt_inputs = build_prompt_inputs(
+        tokenizer, args.prompt_length, args.batch_size, device
+    )
+    generation_length = args.worker_generation_length
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    latency_s = decode_once(model, prompt_inputs, generation_length, device)
+
+    peak_allocated = (
+        torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        if device.type == "cuda"
+        else 0.0
+    )
+    peak_reserved = (
+        torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+        if device.type == "cuda"
+        else 0.0
+    )
+
+    if args.worker_mode == "warmup":
+        print(RESULT_PREFIX + json.dumps({"warmup": True}), flush=True)
+        return
+
+    total_generated_tokens = args.batch_size * generation_length
+    row = {
+        "method": args.method,
+        "repeat": args.worker_repeat,
+        "model": args.model,
+        "prompt_tokens": args.prompt_length,
+        "generation_tokens": generation_length,
+        "max_batch_size": args.batch_size,
+        "decode_latency_s": latency_s,
+        "throughput_tokens_per_second": total_generated_tokens / latency_s,
+        "per_sequence_tokens_per_second": generation_length / latency_s,
+        "peak_memory_allocated_mb": peak_allocated,
+        "peak_memory_reserved_mb": peak_reserved,
+        "budget": args.budget if args.method == "triattention" else "",
+        "device": str(device),
+        "dtype": args.dtype,
+    }
+    print(RESULT_PREFIX + json.dumps(row), flush=True)
+
+
+def common_worker_command(
+    args: argparse.Namespace,
+    *,
+    method: str,
+    generation_length: int,
+    batch_size: int,
+    worker_mode: str,
+    repeat: int = -1,
 ) -> list[str]:
-    command = [
-        sys.executable, str(Path(__file__).resolve()), "--_worker", "--worker-mode", mode,
-        "--method", method, "--model", args.model,
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--_worker",
+        "--worker-mode", worker_mode,
+        "--worker-repeat", str(repeat),
+        "--method", method,
+        "--worker-generation-length", str(generation_length),
+        "--batch-size", str(batch_size),
+        "--model", args.model,
         "--prompt-length", str(args.prompt_length),
         "--generation-lengths", str(generation_length),
-        "--batch-size", str(batch_size), "--repeats", str(args.repeats),
-        "--warmup", str(args.warmup), "--budget", str(args.budget),
-        "--divide-length", str(args.divide_length), "--device", args.device,
-        "--dtype", args.dtype, "--attn-implementation", args.attn_implementation,
-        "--seed", str(args.seed), "--score-aggregation", args.score_aggregation,
-        "--max-batch-limit", str(args.max_batch_limit),
+        "--repeats", str(args.repeats),
+        "--warmup", str(args.warmup),
+        "--budget", str(args.budget),
+        "--divide-length", str(args.divide_length),
+        "--device", args.device,
+        "--dtype", args.dtype,
+        "--attn-implementation", args.attn_implementation,
+        "--seed", str(args.seed),
+        "--score-aggregation", args.score_aggregation,
     ]
     if args.stats_path is not None:
-        command.extend(["--stats-path", str(args.stats_path)])
+        cmd.extend(["--stats-path", str(args.stats_path)])
     if args.trust_remote_code:
-        command.append("--trust-remote-code")
+        cmd.append("--trust-remote-code")
     if args.normalize_scores:
-        command.append("--normalize-scores")
+        cmd.append("--normalize-scores")
     if args.per_head_pruning:
-        command.append("--per-head-pruning")
+        cmd.append("--per-head-pruning")
     if args.per_layer_perhead_pruning:
-        command.append("--per-layer-perhead-pruning")
+        cmd.append("--per-layer-perhead-pruning")
     if args.disable_mlr:
-        command.append("--disable-mlr")
+        cmd.append("--disable-mlr")
     if args.disable_trig:
-        command.append("--disable-trig")
-    command.extend(["--layer-perhead-aggregation", args.layer_perhead_aggregation])
-    return command
+        cmd.append("--disable-trig")
+    cmd.extend(["--layer-perhead-aggregation", args.layer_perhead_aggregation])
+    return cmd
 
 
-def run_subprocess(
-    args: argparse.Namespace, method: str, generation_length: int, batch_size: int, mode: str
-) -> object:
-    worker_env = os.environ.copy()
-    allocator_conf = worker_env.get("PYTORCH_CUDA_ALLOC_CONF", "")
-    if "expandable_segments" not in allocator_conf:
-        worker_env["PYTORCH_CUDA_ALLOC_CONF"] = (
-            f"{allocator_conf},expandable_segments:True".strip(",")
-        )
-    result = subprocess.run(
-        worker_command(args, method, generation_length, batch_size, mode),
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        env=worker_env,
+def run_feasibility(
+    args: argparse.Namespace,
+    method: str,
+    generation_length: int,
+    batch_size: int,
+) -> bool:
+    """Fresh subprocess per candidate. False means CUDA OOM only."""
+    cmd = common_worker_command(
+        args,
+        method=method,
+        generation_length=generation_length,
+        batch_size=batch_size,
+        worker_mode="feasibility",
     )
+    result = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True)
+
+    if result.returncode == 0:
+        return True
+    if result.returncode == OOM_EXIT_CODE:
+        return False
+
+    # Any non-OOM error is a correctness/configuration failure and must be visible.
+    raise RuntimeError(
+        f"{method} batch-feasibility worker failed for "
+        f"generation_length={generation_length}, batch_size={batch_size} "
+        f"(exit {result.returncode}).\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+
+
+def find_max_batch(
+    args: argparse.Namespace,
+    method: str,
+    generation_length: int,
+) -> int:
+    limit = args.max_batch_limit
+
+    print(f"[search] method={method} generation={generation_length}: trying batch=1")
+    if not run_feasibility(args, method, generation_length, 1):
+        raise RuntimeError(
+            f"{method} cannot complete generation_length={generation_length} even at batch_size=1."
+        )
+
+    low = 1
+    if limit == 1:
+        return 1
+
+    # Exponential search: 1, 2, 4, 8, ...
+    high = 2
+    failed_high: int | None = None
+    while high <= limit:
+        print(f"[search] method={method} generation={generation_length}: trying batch={high}")
+        if run_feasibility(args, method, generation_length, high):
+            low = high
+            if high == limit:
+                return high
+            high *= 2
+        else:
+            failed_high = high
+            break
+
+    if failed_high is None:
+        # We stepped past a non-power-of-two limit. Test the limit exactly.
+        if low < limit:
+            print(f"[search] method={method} generation={generation_length}: trying batch={limit}")
+            if run_feasibility(args, method, generation_length, limit):
+                return limit
+            failed_high = limit
+        else:
+            return low
+
+    # Binary search strictly between largest success and failed candidate.
+    left, right = low + 1, failed_high - 1
+    best = low
+    while left <= right:
+        mid = (left + right) // 2
+        print(f"[search] method={method} generation={generation_length}: trying batch={mid}")
+        if run_feasibility(args, method, generation_length, mid):
+            best = mid
+            left = mid + 1
+        else:
+            right = mid - 1
+    return best
+
+
+def run_single_process(
+    args: argparse.Namespace,
+    method: str,
+    generation_length: int,
+    batch_size: int,
+    *,
+    worker_mode: str,
+    repeat: int = -1,
+) -> dict[str, object]:
+    """Launch one fresh worker that performs exactly one full generation."""
+    cmd = common_worker_command(
+        args,
+        method=method,
+        generation_length=generation_length,
+        batch_size=batch_size,
+        worker_mode=worker_mode,
+        repeat=repeat,
+    )
+    result = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True)
     if result.returncode != 0:
         raise RuntimeError(
-            f"{method} {mode} worker failed (exit {result.returncode}).\n"
-            f"{result.stdout}\n{result.stderr}"
+            f"{method} {worker_mode} worker failed for "
+            f"generation_length={generation_length}, batch_size={batch_size}, "
+            f"repeat={repeat} (exit {result.returncode}).\n"
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
+
     for line in reversed(result.stdout.splitlines()):
         if line.startswith(RESULT_PREFIX):
             return json.loads(line.removeprefix(RESULT_PREFIX))
-    raise RuntimeError(f"{method} {mode} worker returned no result.\n{result.stdout}\n{result.stderr}")
+
+    raise RuntimeError(
+        f"{method} {worker_mode} worker returned no result.\n"
+        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
 
 
-def is_feasible(args: argparse.Namespace, method: str, generation_length: int, batch_size: int) -> bool:
-    result = run_subprocess(args, method, generation_length, batch_size, "feasibility")
-    assert isinstance(result, dict)
-    return bool(result["feasible"])
-
-
-def find_max_batch_size(args: argparse.Namespace, method: str, generation_length: int) -> int:
-    """Find the largest whole-generation-feasible batch using fresh workers."""
-    if args.batch_size is not None:
-        if not is_feasible(args, method, generation_length, args.batch_size):
-            raise RuntimeError(
-                f"Fixed batch size {args.batch_size} is not feasible for {method}, "
-                f"generation length {generation_length}."
-            )
-        return args.batch_size
-
-    largest_success = 0
-    candidate = 1
-    first_failure: int | None = None
-    while candidate <= args.max_batch_limit:
-        if is_feasible(args, method, generation_length, candidate):
-            largest_success = candidate
-            if candidate == args.max_batch_limit:
-                return candidate
-            next_candidate = min(candidate * 2, args.max_batch_limit)
-            if next_candidate == candidate:
-                return candidate
-            candidate = next_candidate
-        else:
-            first_failure = candidate
-            break
-
-    if largest_success == 0:
-        raise RuntimeError(
-            f"Batch size 1 is not feasible for {method}, generation length {generation_length}."
+def run_measurements(
+    args: argparse.Namespace,
+    method: str,
+    generation_length: int,
+    batch_size: int,
+) -> list[dict[str, object]]:
+    """Warmups and every measured repeat each run in their own fresh process."""
+    for warmup_idx in range(args.warmup):
+        print(
+            f"[warmup] method={method} generation={generation_length} "
+            f"batch={batch_size} warmup={warmup_idx + 1}/{args.warmup}"
         )
-    if first_failure is None:
-        return largest_success
+        run_single_process(
+            args,
+            method,
+            generation_length,
+            batch_size,
+            worker_mode="warmup",
+        )
 
-    low, high = largest_success, first_failure - 1
-    while low < high:
-        middle = (low + high + 1) // 2
-        if is_feasible(args, method, generation_length, middle):
-            low = middle
-        else:
-            high = middle - 1
-    return low
+    rows: list[dict[str, object]] = []
+    for repeat in range(args.repeats):
+        print(
+            f"[measure] method={method} generation={generation_length} "
+            f"batch={batch_size} repeat={repeat + 1}/{args.repeats}"
+        )
+        rows.append(
+            run_single_process(
+                args,
+                method,
+                generation_length,
+                batch_size,
+                worker_mode="measure",
+                repeat=repeat,
+            )
+        )
+    return rows
 
 
 def write_csv(output: Path, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        raise RuntimeError("No throughput rows were produced.")
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+    fields = [
+        "method",
+        "repeat",
+        "model",
+        "prompt_tokens",
+        "generation_tokens",
+        "max_batch_size",
+        "decode_latency_s",
+        "throughput_tokens_per_second",
+        "per_sequence_tokens_per_second",
+        "peak_memory_allocated_mb",
+        "peak_memory_reserved_mb",
+        "budget",
+        "device",
+        "dtype",
+    ]
+    with output.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -376,7 +516,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     parser.add_argument(
-        "--attn-implementation", choices=["sdpa", "eager"], default="sdpa",
+        "--attn-implementation",
+        choices=["sdpa", "eager"],
+        default="sdpa",
         help="Transformers attention backend; neither option requires flash-attn.",
     )
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -388,48 +530,97 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer-perhead-aggregation", choices=["mean", "max"], default="max")
     parser.add_argument("--disable-mlr", action="store_true")
     parser.add_argument("--disable-trig", action="store_true")
-    parser.add_argument("--max-batch-limit", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, help="Fixed batch size; skips maximum-batch search.")
+    parser.add_argument(
+        "--mode",
+        choices=["both", "tri_only"],
+        default="both",
+        help=(
+            "Benchmark mode: 'both' measures FullKV and TriAttention; "
+            "'tri_only' skips FullKV and measures only TriAttention."
+        ),
+    )
+
+    parser.add_argument(
+        "--max-batch-limit",
+        type=int,
+        default=64,
+        help="Largest batch size considered by max-batch search (default: 64).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Fixed-batch mode: skip max-batch search and use this batch for both methods.",
+    )
+
+    # Internal subprocess protocol.
     parser.add_argument("--method", choices=["fullkv", "triattention"], help=argparse.SUPPRESS)
-    parser.add_argument("--worker-mode", choices=["feasibility", "measurement"], help=argparse.SUPPRESS)
     parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--worker-mode",
+        choices=["feasibility", "warmup", "measure"],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--worker-generation-length", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-repeat", type=int, default=-1, help=argparse.SUPPRESS)
+
     args = parser.parse_args()
+
     if args.prompt_length <= 0 or args.repeats <= 0 or args.warmup < 0:
         parser.error("prompt length and repeats must be positive; warmup cannot be negative")
     if args.budget <= 0 or args.divide_length <= 0:
         parser.error("budget and divide length must be positive")
-    if args.max_batch_limit <= 0 or (args.batch_size is not None and args.batch_size <= 0):
-        parser.error("batch sizes must be positive")
-    if args._worker and (args.method is None or args.worker_mode is None):
-        parser.error("internal worker requires --method and --worker-mode")
-    if not args._worker and args.stats_path is None:
+    if args.max_batch_limit <= 0:
+        parser.error("--max-batch-limit must be positive")
+    if args.batch_size is not None and args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args._worker:
+        if args.method is None or args.worker_mode is None or args.worker_generation_length is None:
+            parser.error("internal worker requires --method, --worker-mode and --worker-generation-length")
+        if args.batch_size is None:
+            parser.error("internal worker requires --batch-size")
+    elif args.stats_path is None:
         parser.error("--stats-path is required to compare against TriAttention")
+
     if args.stats_path is not None:
-        # Parent workers run from REPO_ROOT; retain the user's original CWD here.
         args.stats_path = args.stats_path.expanduser().resolve()
     return args
 
 
 def main() -> None:
     args = parse_args()
+
     if args._worker:
         if args.worker_mode == "feasibility":
-            result: object = run_feasibility_worker(args)
+            feasibility_worker(args)
         else:
-            result = run_measurement_worker(args)
-        print(RESULT_PREFIX + json.dumps(result))
+            single_run_worker(args)
         return
 
     rows: list[dict[str, object]] = []
+
+    methods = ("triattention",) if args.mode == "tri_only" else ("fullkv", "triattention")
+    print(f"[mode] {args.mode}: methods={list(methods)}")
+
     for generation_length in args.generation_lengths:
-        for method in ("fullkv", "triattention"):
-            batch_size = find_max_batch_size(args, method, generation_length)
-            print(f"{method}: generation_length={generation_length}, batch_size={batch_size}")
-            measured_rows = run_subprocess(
-                args, method, generation_length, batch_size, "measurement"
+        for method in methods:
+            if args.batch_size is not None:
+                batch_size = args.batch_size
+                print(
+                    f"[fixed-batch] method={method} generation={generation_length} "
+                    f"batch={batch_size}"
+                )
+            else:
+                batch_size = find_max_batch(args, method, generation_length)
+                print(
+                    f"[max-batch] method={method} generation={generation_length} "
+                    f"batch={batch_size}"
+                )
+
+            rows.extend(
+                run_measurements(args, method, generation_length, batch_size)
             )
-            assert isinstance(measured_rows, list)
-            rows.extend(measured_rows)
+
     write_csv(args.output, rows)
     print(f"Wrote {len(rows)} throughput measurements to {args.output}")
 
