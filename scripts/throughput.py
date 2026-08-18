@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 import subprocess
 import sys
@@ -129,13 +130,93 @@ def apply_triattention(model: Any, args: argparse.Namespace) -> None:
     )
 
 
+
+def inspect_physical_cache(past_key_values: Any) -> dict[str, object]:
+    """Inspect actual materialized KV sequence lengths without trusting budget metadata.
+
+    Returns per-sequence physical token length for every cache layer when the
+    installed Transformers cache exposes its tensors. This intentionally reads
+    tensor shape[-2], i.e. the physically materialized sequence dimension.
+    """
+    lengths: list[int] = []
+
+    # Current Transformers DynamicCache / Cache API.
+    layers = getattr(past_key_values, "layers", None)
+    if layers is not None:
+        for layer in layers:
+            keys = getattr(layer, "keys", None)
+            if keys is None:
+                keys = getattr(layer, "key_cache", None)
+            if torch.is_tensor(keys):
+                lengths.append(int(keys.shape[-2]))
+
+    # Older Transformers DynamicCache API: key_cache is a list of tensors.
+    if not lengths:
+        key_cache = getattr(past_key_values, "key_cache", None)
+        if isinstance(key_cache, (list, tuple)):
+            for keys in key_cache:
+                if torch.is_tensor(keys):
+                    lengths.append(int(keys.shape[-2]))
+
+    # Legacy tuple-of-(K,V) cache.
+    if not lengths and isinstance(past_key_values, (list, tuple)):
+        for layer in past_key_values:
+            if (
+                isinstance(layer, (list, tuple))
+                and len(layer) >= 1
+                and torch.is_tensor(layer[0])
+            ):
+                lengths.append(int(layer[0].shape[-2]))
+
+    if not lengths:
+        # Last-resort diagnostic only. get_seq_length may be logical for some
+        # custom cache implementations, so mark this separately.
+        get_seq_length = getattr(past_key_values, "get_seq_length", None)
+        if callable(get_seq_length):
+            try:
+                fallback = int(get_seq_length())
+            except TypeError:
+                fallback = int(get_seq_length(0))
+            return {
+                "physical_cache_inspection": "fallback_get_seq_length",
+                "physical_cache_tokens_layer0": fallback,
+                "physical_cache_tokens_min": fallback,
+                "physical_cache_tokens_mean": float(fallback),
+                "physical_cache_tokens_max": fallback,
+                "physical_cache_tokens_sum_layers": fallback,
+                "physical_cache_num_layers": 1,
+                "physical_cache_layer_lengths": [fallback],
+            }
+
+        return {
+            "physical_cache_inspection": "unavailable",
+            "physical_cache_tokens_layer0": -1,
+            "physical_cache_tokens_min": -1,
+            "physical_cache_tokens_mean": -1.0,
+            "physical_cache_tokens_max": -1,
+            "physical_cache_tokens_sum_layers": -1,
+            "physical_cache_num_layers": 0,
+            "physical_cache_layer_lengths": [],
+        }
+
+    return {
+        "physical_cache_inspection": "tensor_shape",
+        "physical_cache_tokens_layer0": lengths[0],
+        "physical_cache_tokens_min": min(lengths),
+        "physical_cache_tokens_mean": sum(lengths) / len(lengths),
+        "physical_cache_tokens_max": max(lengths),
+        "physical_cache_tokens_sum_layers": sum(lengths),
+        "physical_cache_num_layers": len(lengths),
+        "physical_cache_layer_lengths": lengths,
+    }
+
 @torch.inference_mode()
 def decode_once(
     model: Any,
     prompt_inputs: dict[str, torch.Tensor],
     generation_length: int,
     device: torch.device,
-) -> float:
+) -> tuple[float, dict[str, object]]:
     """Return decode-only host wall time. Prefill is intentionally untimed."""
     prefill = model(**prompt_inputs, use_cache=True, return_dict=True)
     synchronize(device)
@@ -162,7 +243,9 @@ def decode_once(
         # Keep greedy token selection inside the timed decode region.
         next_token = output.logits[:, -1:].argmax(dim=-1)
     synchronize(device)
-    return time.perf_counter() - started
+    latency_s = time.perf_counter() - started
+    cache_stats = inspect_physical_cache(past_key_values)
+    return latency_s, cache_stats
 
 
 def load_worker_state(args: argparse.Namespace) -> tuple[Any, Any, torch.device]:
@@ -193,8 +276,29 @@ def load_worker_state(args: argparse.Namespace) -> tuple[Any, Any, torch.device]
 
 
 def is_cuda_oom(exc: BaseException) -> bool:
-    # torch.OutOfMemoryError is CUDA's dedicated OOM exception in current PyTorch.
-    return isinstance(exc, torch.OutOfMemoryError)
+    """Return True only for explicit CUDA-memory/allocator failure signatures.
+
+    PyTorch normally raises torch.OutOfMemoryError, but at very large batches
+    the CUDA caching allocator can fail first with an NVML/CUDACachingAllocator
+    RuntimeError. Those are treated as an infeasible batch as well so the
+    search can continue instead of aborting.
+    """
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+
+    message = str(exc).lower()
+    oom_signatures = (
+        "cuda out of memory",
+        "cuda error: out of memory",
+        "cudacachingallocator",
+        "nvml_success == r internal assert failed",
+        "outofmemoryerror",
+    )
+    return any(signature in message for signature in oom_signatures)
+
+
+class WorkerOOM(RuntimeError):
+    """Parent-side signal that a fresh worker hit a CUDA memory limit."""
 
 
 def feasibility_worker(args: argparse.Namespace) -> None:
@@ -204,8 +308,35 @@ def feasibility_worker(args: argparse.Namespace) -> None:
         prompt_inputs = build_prompt_inputs(
             tokenizer, args.prompt_length, args.batch_size, device
         )
-        decode_once(model, prompt_inputs, args.worker_generation_length, device)
-        print(FEASIBLE_PREFIX + json.dumps({"batch_size": args.batch_size}))
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+
+        latency_s, cache_stats = decode_once(
+            model,
+            prompt_inputs,
+            args.worker_generation_length,
+            device,
+        )
+
+        peak_allocated_mb = (
+            torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            if device.type == "cuda"
+            else 0.0
+        )
+        peak_reserved_mb = (
+            torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+            if device.type == "cuda"
+            else 0.0
+        )
+
+        payload = {
+            "batch_size": args.batch_size,
+            "decode_latency_s": latency_s,
+            "peak_memory_allocated_mb": peak_allocated_mb,
+            "peak_memory_reserved_mb": peak_reserved_mb,
+            **cache_stats,
+        }
+        print(FEASIBLE_PREFIX + json.dumps(payload), flush=True)
     except BaseException as exc:
         if is_cuda_oom(exc):
             # This process exits immediately, so allocator state cannot contaminate
@@ -221,50 +352,74 @@ def feasibility_worker(args: argparse.Namespace) -> None:
 
 def single_run_worker(args: argparse.Namespace) -> None:
     """Run exactly one full prefill+decode in this fresh worker process."""
-    tokenizer, model, device = load_worker_state(args)
-    prompt_inputs = build_prompt_inputs(
-        tokenizer, args.prompt_length, args.batch_size, device
-    )
-    generation_length = args.worker_generation_length
+    try:
+        tokenizer, model, device = load_worker_state(args)
+        prompt_inputs = build_prompt_inputs(
+            tokenizer, args.prompt_length, args.batch_size, device
+        )
+        generation_length = args.worker_generation_length
 
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
-    latency_s = decode_once(model, prompt_inputs, generation_length, device)
+        latency_s, cache_stats = decode_once(
+            model,
+            prompt_inputs,
+            generation_length,
+            device,
+        )
 
-    peak_allocated = (
-        torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-        if device.type == "cuda"
-        else 0.0
-    )
-    peak_reserved = (
-        torch.cuda.max_memory_reserved(device) / (1024 ** 2)
-        if device.type == "cuda"
-        else 0.0
-    )
+        peak_allocated = (
+            torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            if device.type == "cuda"
+            else 0.0
+        )
+        peak_reserved = (
+            torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+            if device.type == "cuda"
+            else 0.0
+        )
 
-    if args.worker_mode == "warmup":
-        print(RESULT_PREFIX + json.dumps({"warmup": True}), flush=True)
-        return
+        if args.worker_mode == "warmup":
+            print(RESULT_PREFIX + json.dumps({"warmup": True}), flush=True)
+            return
 
-    total_generated_tokens = args.batch_size * generation_length
-    row = {
-        "method": args.method,
-        "repeat": args.worker_repeat,
-        "model": args.model,
-        "prompt_tokens": args.prompt_length,
-        "generation_tokens": generation_length,
-        "max_batch_size": args.batch_size,
-        "decode_latency_s": latency_s,
-        "throughput_tokens_per_second": total_generated_tokens / latency_s,
-        "per_sequence_tokens_per_second": generation_length / latency_s,
-        "peak_memory_allocated_mb": peak_allocated,
-        "peak_memory_reserved_mb": peak_reserved,
-        "budget": args.budget if args.method == "triattention" else "",
-        "device": str(device),
-        "dtype": args.dtype,
-    }
-    print(RESULT_PREFIX + json.dumps(row), flush=True)
+        total_generated_tokens = args.batch_size * generation_length
+        row = {
+            "method": args.method,
+            "repeat": args.worker_repeat,
+            "model": args.model,
+            "prompt_tokens": args.prompt_length,
+            "generation_tokens": generation_length,
+            "max_batch_size": args.batch_size,
+            "decode_latency_s": latency_s,
+            "throughput_tokens_per_second": total_generated_tokens / latency_s,
+            "per_sequence_tokens_per_second": generation_length / latency_s,
+            "peak_memory_allocated_mb": peak_allocated,
+            "peak_memory_reserved_mb": peak_reserved,
+            "budget": args.budget if args.method == "triattention" else "",
+            "final_logical_tokens": args.prompt_length + generation_length,
+            **cache_stats,
+            "device": str(device),
+            "dtype": args.dtype,
+        }
+        print(RESULT_PREFIX + json.dumps(row), flush=True)
+
+    except BaseException as exc:
+        if is_cuda_oom(exc):
+            print(
+                RESULT_PREFIX
+                + json.dumps(
+                    {
+                        "oom": True,
+                        "batch_size": args.batch_size,
+                        "worker_mode": args.worker_mode,
+                    }
+                ),
+                flush=True,
+            )
+            raise SystemExit(OOM_EXIT_CODE)
+        raise
 
 
 def common_worker_command(
@@ -316,6 +471,17 @@ def common_worker_command(
     return cmd
 
 
+
+def worker_env() -> dict[str, str]:
+    """Fresh worker environment with fragmentation-resistant CUDA allocation."""
+    env = dict(os.environ)
+    alloc_conf = env.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments" not in alloc_conf:
+        env["PYTORCH_CUDA_ALLOC_CONF"] = (
+            f"{alloc_conf},expandable_segments:True".strip(",")
+        )
+    return env
+
 def run_feasibility(
     args: argparse.Namespace,
     method: str,
@@ -330,9 +496,25 @@ def run_feasibility(
         batch_size=batch_size,
         worker_mode="feasibility",
     )
-    result = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True)
+    result = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True, env=worker_env())
 
     if result.returncode == 0:
+        payload = None
+        for line in reversed(result.stdout.splitlines()):
+            if line.startswith(FEASIBLE_PREFIX):
+                payload = json.loads(line.removeprefix(FEASIBLE_PREFIX))
+                break
+
+        if payload is not None:
+            print(
+                "[feasible] "
+                f"batch={batch_size} "
+                f"physical_kv_mean={payload.get('physical_cache_tokens_mean')} "
+                f"physical_kv_min={payload.get('physical_cache_tokens_min')} "
+                f"physical_kv_max={payload.get('physical_cache_tokens_max')} "
+                f"peak_allocated_mb={payload.get('peak_memory_allocated_mb', 0.0):.1f} "
+                f"peak_reserved_mb={payload.get('peak_memory_reserved_mb', 0.0):.1f}"
+            )
         return True
     if result.returncode == OOM_EXIT_CODE:
         return False
@@ -418,7 +600,13 @@ def run_single_process(
         worker_mode=worker_mode,
         repeat=repeat,
     )
-    result = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True)
+    result = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True, env=worker_env())
+    if result.returncode == OOM_EXIT_CODE:
+        raise WorkerOOM(
+            f"{method} {worker_mode} hit a CUDA memory limit at "
+            f"generation_length={generation_length}, batch_size={batch_size}, "
+            f"repeat={repeat}."
+        )
     if result.returncode != 0:
         raise RuntimeError(
             f"{method} {worker_mode} worker failed for "
@@ -442,38 +630,85 @@ def run_measurements(
     method: str,
     generation_length: int,
     batch_size: int,
+    *,
+    allow_backoff: bool = True,
 ) -> list[dict[str, object]]:
-    """Warmups and every measured repeat each run in their own fresh process."""
-    for warmup_idx in range(args.warmup):
-        print(
-            f"[warmup] method={method} generation={generation_length} "
-            f"batch={batch_size} warmup={warmup_idx + 1}/{args.warmup}"
-        )
-        run_single_process(
-            args,
-            method,
-            generation_length,
-            batch_size,
-            worker_mode="warmup",
-        )
+    """Measure a stable batch; back off if a final fresh worker hits memory limit.
 
-    rows: list[dict[str, object]] = []
-    for repeat in range(args.repeats):
-        print(
-            f"[measure] method={method} generation={generation_length} "
-            f"batch={batch_size} repeat={repeat + 1}/{args.repeats}"
-        )
-        rows.append(
-            run_single_process(
-                args,
-                method,
-                generation_length,
-                batch_size,
-                worker_mode="measure",
-                repeat=repeat,
+    Feasibility search and final measurement are separate fresh processes.
+    Very close to the memory boundary, allocator variance can make the searched
+    maximum fail during warmup/repeat. In max-batch mode we then reduce the
+    batch by one and restart all warmups/repeats so every CSV row uses one
+    stable fixed batch. Fixed-batch mode never silently changes the requested B.
+    """
+    current_batch = batch_size
+
+    while current_batch >= 1:
+        try:
+            for warmup_idx in range(args.warmup):
+                print(
+                    f"[warmup] method={method} generation={generation_length} "
+                    f"batch={current_batch} warmup={warmup_idx + 1}/{args.warmup}"
+                )
+                run_single_process(
+                    args,
+                    method,
+                    generation_length,
+                    current_batch,
+                    worker_mode="warmup",
+                )
+
+            rows: list[dict[str, object]] = []
+            for repeat in range(args.repeats):
+                print(
+                    f"[measure] method={method} generation={generation_length} "
+                    f"batch={current_batch} repeat={repeat + 1}/{args.repeats}"
+                )
+                row = run_single_process(
+                    args,
+                    method,
+                    generation_length,
+                    current_batch,
+                    worker_mode="measure",
+                    repeat=repeat,
+                )
+                print(
+                    "[result] "
+                    f"method={method} generation={generation_length} "
+                    f"batch={current_batch} repeat={repeat} "
+                    f"physical_kv_mean={row.get('physical_cache_tokens_mean')} "
+                    f"physical_kv_min={row.get('physical_cache_tokens_min')} "
+                    f"physical_kv_max={row.get('physical_cache_tokens_max')} "
+                    f"peak_allocated_mb={row.get('peak_memory_allocated_mb', 0.0):.1f} "
+                    f"peak_reserved_mb={row.get('peak_memory_reserved_mb', 0.0):.1f}"
+                )
+                rows.append(row)
+
+            if current_batch != batch_size:
+                print(
+                    f"[stable-batch] method={method} generation={generation_length}: "
+                    f"search_max={batch_size}, measured_batch={current_batch}"
+                )
+            return rows
+
+        except WorkerOOM as exc:
+            if not allow_backoff:
+                raise RuntimeError(
+                    f"Requested fixed batch {current_batch} is not memory-stable."
+                ) from exc
+            if current_batch == 1:
+                raise RuntimeError(
+                    f"{method} cannot complete a stable measurement even at batch=1."
+                ) from exc
+
+            next_batch = current_batch - 1
+            print(
+                f"[memory-backoff] method={method} generation={generation_length}: "
+                f"batch={current_batch} was not stable; retrying batch={next_batch}"
             )
-        )
-    return rows
+            current_batch = next_batch
+
+    raise RuntimeError("No stable batch size found.")
 
 
 def write_csv(output: Path, rows: list[dict[str, object]]) -> None:
@@ -493,13 +728,30 @@ def write_csv(output: Path, rows: list[dict[str, object]]) -> None:
         "peak_memory_allocated_mb",
         "peak_memory_reserved_mb",
         "budget",
+        "final_logical_tokens",
+        "physical_cache_inspection",
+        "physical_cache_tokens_layer0",
+        "physical_cache_tokens_min",
+        "physical_cache_tokens_mean",
+        "physical_cache_tokens_max",
+        "physical_cache_tokens_sum_layers",
+        "physical_cache_num_layers",
+        "physical_cache_layer_lengths",
         "device",
         "dtype",
     ]
     with output.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(rows)
+        normalized_rows = []
+        for row in rows:
+            row = dict(row)
+            if isinstance(row.get("physical_cache_layer_lengths"), list):
+                row["physical_cache_layer_lengths"] = json.dumps(
+                    row["physical_cache_layer_lengths"]
+                )
+            normalized_rows.append(row)
+        writer.writerows(normalized_rows)
 
 
 def parse_args() -> argparse.Namespace:
@@ -618,7 +870,13 @@ def main() -> None:
                 )
 
             rows.extend(
-                run_measurements(args, method, generation_length, batch_size)
+                run_measurements(
+                    args,
+                    method,
+                    generation_length,
+                    batch_size,
+                    allow_backoff=(args.batch_size is None),
+                )
             )
 
     write_csv(args.output, rows)
