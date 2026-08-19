@@ -674,7 +674,7 @@ def main() -> None:
     config = load_config(args.config)
     experiment = config.get("experiment", {})
 
-    conda_env = experiment.get("conda_env", "triattention")
+    conda_env = experiment.get("conda_env", "tri")
     runner_path = resolve_path(experiment["runner_path"])
     total_shards = args.num_shards or experiment.get("num_shards", 1)
     gpus = determine_gpus(args, experiment)
