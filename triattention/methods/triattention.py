@@ -822,7 +822,10 @@ def apply_triattention_patch(
                     device=input_ids.device, dtype=torch.long,
                 )
 
-            attention_mask_override = None
+            # Preserve the benchmark's logical attention mask for the same
+            # decode-call protocol as FullKV/R-KV/RPC/Proposed. Qwen attention
+            # slices its final mask dimension to the physical KV length.
+            attention_mask_override = attention_mask
         else:
             cache_position_override = None
 
