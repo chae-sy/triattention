@@ -5,12 +5,14 @@ from typing import Iterable, List, Sequence
 
 from transformers import AutoTokenizer
 
+# Canonical RPC/AIME prompt shared with src.aime_utils.build_aime_prompt.
+# Keep this byte-for-byte equivalent so FullKV, R-KV, RDP, and TriAttention
+# receive the same user content in fair comparisons.
 PROMPT_TEMPLATE = (
-    "You are given a math problem.\n\nProblem: {question}\n\n "
-    "You need to solve the problem step by step. First, you need to provide the chain-of-thought, "
-    "then provide the final answer.\n\n Provide the final answer in the format: Final answer:  \\boxed{{}}"
+    "{question}\n"
+    "Please reason step by step, and put your final answer within \\boxed{{}}."
 )
-DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+DEFAULT_SYSTEM_PROMPT = ""
 
 
 def extract_question_from_record(
@@ -58,10 +60,12 @@ def build_prompt(
     base_prompt = build_plain_prompt(question)
     if not use_chat_template:
         return base_prompt
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": base_prompt},
-    ]
+    # pred_rdp_evict.py renders a single user message.  Do not inject an empty
+    # system turn because it can change the serialized chat-template tokens.
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": base_prompt})
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 

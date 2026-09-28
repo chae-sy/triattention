@@ -56,9 +56,6 @@ dataset2max_length = {
     "math500": 8192,
 }
 
-RUN_SEED_STRIDE = 1_000_000
-
-
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -243,11 +240,19 @@ def load_dataset(
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=888)
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Base sampling seed. Draw i uses seed+i, matching pred_rdp_evict.py.",
+    )
     parser.add_argument("--dataset_path", "--dataset-path", dest="dataset_path", type=str, required=True)
     parser.add_argument("--output_dir", "--output-dir", dest="output_dir", type=str, required=True)
     parser.add_argument("--model_path", "--model-path", dest="model_path", type=str, required=True)
     parser.add_argument("--max_length", "--max-length", dest="max_length", type=int, default=-1)
+    parser.add_argument(
+        "--max_new_tokens", "--max-new-tokens", dest="max_new_tokens",
+        type=int, default=None,
+        help="Maximum generated tokens. Preferred over max_length and matches pred_rdp_evict.py.",
+    )
     parser.add_argument("--eval_batch_size", "--eval-batch-size", dest="eval_batch_size", type=int, default=1)
     parser.add_argument("--load_dtype", "--load-dtype", dest="load_dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument(
@@ -301,6 +306,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--shard_id", type=int, required=True)
     parser.add_argument("--num_shards", type=int, required=True)
     parser.add_argument("--num_samples", type=int, default=64)
+    parser.add_argument(
+        "--do_sample", "--do-sample", dest="do_sample",
+        type=str2bool, default=True,
+        help="Use multinomial sampling (default: true, matching pred_rdp_evict.py).",
+    )
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument(
@@ -308,9 +318,8 @@ def parse_arguments() -> argparse.Namespace:
         "--top-k",
         dest="top_k",
         type=int,
-        default=None,
-        help="Sampling top-k. None keeps HF/default behavior (typically 50). "
-             "Set <=0 to disable top-k (aligns with vLLM top_k=-1).",
+        default=50,
+        help="Sampling top-k (default: 50, matching pred_rdp_evict.py). Set <=0 to disable.",
     )
     parser.add_argument(
         "--triattention_stats_file",
@@ -448,6 +457,13 @@ def main(args: argparse.Namespace) -> None:
     if (not args.max_length) or args.max_length <= 0:
         if args.dataset_name in dataset2max_length:
             args.max_length = dataset2max_length[args.dataset_name]
+    if args.max_new_tokens is None:
+        # Backward compatibility for old generated YAML files.  New configs
+        # pass max_new_tokens explicitly so prompt length does not reduce the
+        # decode budget.
+        args.max_new_tokens = args.max_length
+    if args.max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
     if args.eval_batch_size != 1:
         raise ValueError("eval_batch_size must be 1 for current TriAttention sharded runner.")
 
@@ -672,14 +688,19 @@ def main(args: argparse.Namespace) -> None:
                     [prompt],
                     padding="longest",
                     return_tensors="pt",
-                    add_special_tokens=True,
+                    # apply_chat_template already emits the model's special
+                    # tokens; match src.chat and avoid a duplicate BOS.
+                    add_special_tokens=not args.use_chat_template,
                 ).to("cuda")
                 prefill_length = int(tokenized_prompts["attention_mask"].sum().item())
                 sample_idx = test_data[local_idx]["index"]
                 if sample_idx in existing_indices:
                     continue
                 record_id = int(test_data[local_idx].get("id", sample_idx))
-                seed_value = args.seed + run_id * RUN_SEED_STRIDE + sample_idx
+                # pred_rdp_evict.py/eval_aime resets every problem to seed+i,
+                # where i is the response (draw) index.  Do not mix the
+                # problem index into the RNG seed.
+                seed_value = args.seed + run_id
                 set_seed(seed_value)
 
                 if capture_root_path and capture_requested_for_sample(record_id):
@@ -704,13 +725,15 @@ def main(args: argparse.Namespace) -> None:
                 gen_started = time.perf_counter()
                 output = model.generate(
                     **tokenized_prompts,
-                    max_length=args.max_length,
-                    do_sample=True,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=args.do_sample,
                     **(
-                        {"top_k": args.top_k if args.top_k > 0 else 0}
-                        if args.top_k is not None
+                        {
+                            "temperature": args.temperature,
+                            "top_p": args.top_p,
+                            "top_k": args.top_k if args.top_k > 0 else 0,
+                        }
+                        if args.do_sample
                         else {}
                     ),
                     num_beams=1,
@@ -737,6 +760,16 @@ def main(args: argparse.Namespace) -> None:
                 record["total_tokens_per_second"] = total_tps
                 record["sample_idx"] = sample_idx
                 record["draw_idx"] = run_id
+                record["generation_config"] = {
+                    "sampling_reference": "scripts/pred_rdp_evict.py",
+                    "seed": seed_value,
+                    "base_seed": args.seed,
+                    "do_sample": args.do_sample,
+                    "temperature": args.temperature if args.do_sample else None,
+                    "top_p": args.top_p if args.do_sample else None,
+                    "top_k": args.top_k if args.do_sample else None,
+                    "max_new_tokens": args.max_new_tokens,
+                }
 
                 shard_generated_samples += 1
                 shard_output_tokens += output_tokens

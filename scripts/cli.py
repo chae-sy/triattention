@@ -277,7 +277,9 @@ def build_config(
             "output_dir": str(output_dir / "shards"),
             "dataset_path": str(dataset_path),
             "model_path": str(model_path),
-            "max_length": dataset_max_length(dataset, defaults),
+            # pred_rdp_evict.py limits newly decoded tokens, not total
+            # prompt+response length.
+            "max_new_tokens": dataset_max_length(dataset, defaults),
             "method": mode,
             "kv_budget": budget,
         },
