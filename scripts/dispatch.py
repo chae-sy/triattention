@@ -301,13 +301,23 @@ def run_completed(base_dir: Path, shard_id: int, run_id: int, expected_records: 
         return False
 
 
-def count_dataset_examples(dataset_path: Path, max_examples: int | None = None) -> int:
-    count = 0
+def count_dataset_examples(
+    dataset_path: Path,
+    max_examples: int | None = None,
+    start: int | None = None,
+    end: int | None = None,
+) -> int:
+    selected = 0
     with dataset_path.open("r", encoding="utf-8") as fp:
-        for count, _ in enumerate(fp, start=1):
-            if max_examples is not None and count >= max_examples:
+        for index, _ in enumerate(fp):
+            if start is not None and index < start:
+                continue
+            if end is not None and index >= end:
+                break
+            selected += 1
+            if max_examples is not None and selected >= max_examples:
                 return max_examples
-    return count
+    return selected
 
 
 def questions_for_shard(total_questions: int, num_shards: int, shard_id: int) -> int:
@@ -726,7 +736,13 @@ def main() -> None:
     except Exception:
         max_examples = None
 
-    dataset_example_count = count_dataset_examples(runner_args["dataset_path"], max_examples)
+    range_start = runner_args.get("start")
+    range_end = runner_args.get("end")
+    range_start = int(range_start) if range_start is not None else None
+    range_end = int(range_end) if range_end is not None else None
+    dataset_example_count = count_dataset_examples(
+        runner_args["dataset_path"], max_examples, range_start, range_end
+    )
 
     base_cmd = build_base_command(conda_env, runner_path, format_runner_args(runner_args, total_shards))
     num_samples = int(runner_args.get("num_samples", 64))

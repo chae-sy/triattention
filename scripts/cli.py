@@ -401,7 +401,15 @@ def run_one(
     defaults: dict,
     extra_config: dict | None,
     dry_run: bool,
+    start: int | None = None,
+    end: int | None = None,
 ) -> None:
+    if start is not None and start < 0:
+        raise ValueError("start must be non-negative")
+    if end is not None and end < 0:
+        raise ValueError("end must be non-negative")
+    if start is not None and end is not None and end <= start:
+        raise ValueError("end must be greater than start")
     dataset_path = resolve_dataset_path(dataset)
     model_path = validate_model_exists(model_name, dry_run)
     tag = budget_tag(mode, budget)
@@ -409,6 +417,9 @@ def run_one(
     num_samples = resolve_num_samples(runner_defaults, dataset)
     sample_dir = sample_tag(num_samples)
     resolved_run_tag = resolve_run_tag(extra_config, run_tag)
+    if start is not None or end is not None:
+        range_tag = f"s{start if start is not None else 0}_e{end if end is not None else 'all'}"
+        resolved_run_tag = tag_with_suffix(resolved_run_tag, range_tag)
 
     stats_path = None
     if mode == "triattention":
@@ -449,6 +460,10 @@ def run_one(
         defaults,
         extra_config,
     )
+    if start is not None:
+        config["experiment"]["runner_args"]["start"] = start
+    if end is not None:
+        config["experiment"]["runner_args"]["end"] = end
     write_config(config, config_path)
     dispatch_run(config_path, dataset, log_dir, dry_run)
 
@@ -849,6 +864,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="YAML config overrides to merge into runner_args or experiment.",
     )
+    run_one_parser.add_argument(
+        "--start", type=int, default=None,
+        help="First dataset index to run (inclusive).",
+    )
+    run_one_parser.add_argument(
+        "--end", type=int, default=None,
+        help="Dataset index at which to stop (exclusive).",
+    )
 
     return parser.parse_args()
 
@@ -894,6 +917,8 @@ def main() -> None:
             defaults=defaults,
             extra_config=extra_config,
             dry_run=args.dry_run,
+            start=args.start,
+            end=args.end,
         )
         return
     raise SystemExit(f"Unknown command: {args.command}")

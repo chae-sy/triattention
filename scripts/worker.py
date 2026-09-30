@@ -211,6 +211,8 @@ def load_dataset(
     use_chat_template: bool,
     system_prompt: str,
     max_examples: int | None = None,
+    start: int | None = None,
+    end: int | None = None,
 ) -> tuple[List[str], List[dict]]:
     prompts: List[str] = []
     test_data: List[dict] = []
@@ -220,6 +222,10 @@ def load_dataset(
 
     with path.open() as f:
         for index, line in enumerate(f):
+            if start is not None and index < start:
+                continue
+            if end is not None and index >= end:
+                break
             example = json.loads(line)
             question = extract_question_from_record(example, fallback_keys=fallback_keys)
             example["question"] = question
@@ -395,6 +401,10 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="Optional cap on number of dataset examples for quick smoke tests.",
     )
+    parser.add_argument("--start", type=int, default=None,
+                        help="First dataset index to run (inclusive).")
+    parser.add_argument("--end", type=int, default=None,
+                        help="Dataset index at which to stop (exclusive).")
     # Alignment args for fair R-KV comparison
     parser.add_argument(
         "--count_prompt_tokens",
@@ -453,6 +463,12 @@ def configure_tokenizer(tokenizer: AutoTokenizer) -> AutoTokenizer:
 
 
 def main(args: argparse.Namespace) -> None:
+    if args.start is not None and args.start < 0:
+        raise ValueError("--start must be non-negative")
+    if args.end is not None and args.end < 0:
+        raise ValueError("--end must be non-negative")
+    if args.start is not None and args.end is not None and args.end <= args.start:
+        raise ValueError("--end must be greater than --start")
     args.dataset_name = Path(args.dataset_path).name.split(".")[0]
     if (not args.max_length) or args.max_length <= 0:
         if args.dataset_name in dataset2max_length:
@@ -511,6 +527,8 @@ def main(args: argparse.Namespace) -> None:
         use_chat_template=prompt_use_chat,
         system_prompt=args.chat_system_prompt,
         max_examples=args.max_examples,
+        start=args.start,
+        end=args.end,
     )
 
     if question_mode:
