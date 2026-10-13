@@ -56,9 +56,6 @@ dataset2max_length = {
     "math500": 8192,
 }
 
-RUN_SEED_STRIDE = 1_000_000
-
-
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -679,7 +676,7 @@ def main(args: argparse.Namespace) -> None:
                 if sample_idx in existing_indices:
                     continue
                 record_id = int(test_data[local_idx].get("id", sample_idx))
-                seed_value = args.seed + run_id * RUN_SEED_STRIDE + sample_idx
+                seed_value = args.seed + run_id
                 set_seed(seed_value)
 
                 if capture_root_path and capture_requested_for_sample(record_id):
